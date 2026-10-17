@@ -1,0 +1,209 @@
+"""Streamlit dashboard for the COVID-19 state simulation."""
+
+from pathlib import Path
+
+import pandas as pd
+import streamlit as st
+
+import assignment2
+
+BASE_DIR = Path(__file__).resolve().parent
+COUNTRIES_FILE = BASE_DIR / "a2-countries.csv"
+PLOT_FILE = BASE_DIR / assignment2.PLOT_FILE
+SUMMARY_FILE = BASE_DIR / assignment2.SUMMARY_FILE
+SIMULATED_FILE = BASE_DIR / assignment2.SIMULATED_FILE
+STATE_COLUMNS = ["D", "H", "I", "M", "S"]
+
+st.set_page_config(
+    page_title="COVID-19 Simulation Lab",
+    page_icon="🧬",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown(
+    """
+    <style>
+      .block-container {padding-top: 1.8rem; padding-bottom: 2.5rem;}
+      [data-testid="stMetric"] {
+        background: rgba(128, 128, 128, 0.07);
+        border: 1px solid rgba(128, 128, 128, 0.18);
+        padding: 0.8rem 1rem;
+        border-radius: 0.8rem;
+      }
+      .small-note {color: #64748b; font-size: 0.88rem;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+@st.cache_data(show_spinner=False)
+def load_countries(path: str) -> pd.DataFrame:
+    """Load the country dataset once per file path."""
+    return pd.read_csv(path)
+
+
+def load_summary() -> pd.DataFrame:
+    """Load the latest summary output."""
+    summary = pd.read_csv(SUMMARY_FILE)
+    if not summary.empty:
+        summary["date"] = pd.to_datetime(summary["date"], errors="coerce")
+    return summary
+
+
+st.title("🧬 COVID-19 Simulation Lab")
+st.markdown(
+    "Explore a simplified, age-group-based COVID-19 state simulation "
+    "and compare how the simulated population changes over time."
+)
+st.caption("Educational stochastic model · Daily time series · Country-level comparisons")
+
+if not COUNTRIES_FILE.is_file():
+    st.error(f"Country dataset not found: `{COUNTRIES_FILE.name}`")
+    st.stop()
+
+try:
+    country_df = load_countries(str(COUNTRIES_FILE))
+except (OSError, pd.errors.ParserError) as exc:
+    st.error(f"Could not read the country dataset: {exc}")
+    st.stop()
+
+if "country" not in country_df.columns:
+    st.error("The country dataset must contain a `country` column.")
+    st.stop()
+
+country_options = sorted(country_df["country"].dropna().astype(str).unique().tolist())
+default_countries = [country for country in ("Afghanistan", "Sweden", "Japan") if country in country_options]
+
+with st.sidebar:
+    st.header("Simulation settings")
+    st.write("Choose the population sample and date range.")
+
+    with st.form("simulation_settings"):
+        sample_ratio = st.number_input(
+            "Sample ratio",
+            min_value=1.0,
+            max_value=1_000_000_000.0,
+            value=1_000_000.0,
+            step=100_000.0,
+            help="A ratio of 1,000,000 represents approximately one sample per million people.",
+        )
+        start_date = st.date_input("Start date", value=pd.Timestamp("2021-04-01").date())
+        end_date = st.date_input("End date", value=pd.Timestamp("2022-04-30").date())
+        selected_countries = st.multiselect(
+            "Countries",
+            options=country_options,
+            default=default_countries,
+            help="Select one or more countries from the provided dataset.",
+        )
+        run_clicked = st.form_submit_button("Run simulation", type="primary", use_container_width=True)
+
+    st.divider()
+    st.markdown("**State legend**")
+    st.markdown("- `H` — Healthy\n- `I` — Infected without symptoms\n- `S` — Infected with symptoms\n- `M` — Immune by infection\n- `D` — Deceased")
+
+if run_clicked:
+    if not selected_countries:
+        st.error("Select at least one country before running the simulation.")
+    elif start_date > end_date:
+        st.error("The start date must be on or before the end date.")
+    else:
+        try:
+            with st.spinner("Simulating daily state transitions and preparing outputs…"):
+                assignment2.run(
+                    countries_csv_name=COUNTRIES_FILE.name,
+                    countries=selected_countries,
+                    sample_ratio=sample_ratio,
+                    start_date=start_date.isoformat(),
+                    end_date=end_date.isoformat(),
+                )
+            st.session_state["last_run"] = {
+                "countries": list(selected_countries),
+                "sample_ratio": sample_ratio,
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+            }
+            st.success("Simulation completed. The CSV files and chart have been updated.")
+        except (ValueError, FileNotFoundError, OSError, KeyError) as exc:
+            st.error(f"The simulation could not be completed: {exc}")
+        except Exception as exc:  # Keep unexpected details available for debugging.
+            st.error("An unexpected error occurred while running the simulation.")
+            with st.expander("Technical details"):
+                st.exception(exc)
+
+last_run = st.session_state.get("last_run")
+if last_run:
+    st.subheader("Latest run")
+    st.write(
+        f"**Countries:** {', '.join(last_run['countries'])}  ·  "
+        f"**Period:** {last_run['start_date']} to {last_run['end_date']}  ·  "
+        f"**Sample ratio:** 1:{last_run['sample_ratio']:,.0f}"
+    )
+
+    if SUMMARY_FILE.is_file():
+        try:
+            summary_df = load_summary()
+            if summary_df.empty:
+                st.info("The run completed, but no individuals were generated for this sample ratio.")
+            else:
+                latest_date = summary_df["date"].max()
+                latest = summary_df[summary_df["date"] == latest_date].copy()
+                for state in STATE_COLUMNS:
+                    if state not in latest.columns:
+                        latest[state] = 0
+                total_people = int(latest[STATE_COLUMNS].sum().sum())
+                infected = int(latest[["I", "S"]].sum().sum())
+                deceased = int(latest["D"].sum())
+                infection_share = (infected / total_people * 100) if total_people else 0.0
+
+                metric_cols = st.columns(4)
+                metric_cols[0].metric("Countries", len(last_run["countries"]))
+                metric_cols[1].metric("Simulated people", f"{total_people:,}")
+                metric_cols[2].metric("Infected (I + S)", f"{infected:,}", f"{infection_share:.1f}% of sample")
+                metric_cols[3].metric("Deceased (D)", f"{deceased:,}")
+
+                st.subheader("State distribution over time")
+                if PLOT_FILE.is_file():
+                    st.image(str(PLOT_FILE), use_container_width=True)
+                else:
+                    st.warning("The simulation chart was not found.")
+
+                st.subheader(f"Country summary on {latest_date:%Y-%m-%d}")
+                display_columns = ["country", *STATE_COLUMNS]
+                st.dataframe(
+                    latest[display_columns].sort_values("country").reset_index(drop=True),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                st.subheader("Download results")
+                download_cols = st.columns(2)
+                if SUMMARY_FILE.is_file():
+                    download_cols[0].download_button(
+                        "Download summary CSV",
+                        data=SUMMARY_FILE.read_bytes(),
+                        file_name=SUMMARY_FILE.name,
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
+                if SIMULATED_FILE.is_file():
+                    download_cols[1].download_button(
+                        "Download individual time series",
+                        data=SIMULATED_FILE.read_bytes(),
+                        file_name=SIMULATED_FILE.name,
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
+        except (OSError, ValueError, pd.errors.ParserError) as exc:
+            st.error(f"Could not load the generated results: {exc}")
+else:
+    st.info("Configure the settings in the sidebar and select **Run simulation** to generate results.")
+
+st.divider()
+st.markdown(
+    '<p class="small-note">This is a simplified educational simulation. '
+    'Its outputs are stochastic and should not be interpreted as real-world '
+    'COVID-19 predictions or medical advice.</p>',
+    unsafe_allow_html=True,
+)
